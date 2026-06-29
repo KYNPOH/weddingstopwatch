@@ -1,29 +1,95 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import { get, push, ref, set } from "firebase/database";
+import { getFirebaseDatabase, isFirebaseConfigured } from "@/lib/firebase";
 
-const STORAGE_KEY = "participantName";
+const STORAGE_KEY_NAME = "participantName";
+const STORAGE_KEY_ID = "participantId";
+
+async function registerParticipant(name: string): Promise<string> {
+  const db = getFirebaseDatabase();
+  const savedId = localStorage.getItem(STORAGE_KEY_ID);
+
+  if (savedId) {
+    const snapshot = await get(ref(db, `users/${savedId}`));
+    if (snapshot.exists()) {
+      await set(ref(db, `users/${savedId}`), {
+        name,
+        status: "waiting",
+      });
+      return savedId;
+    }
+  }
+
+  const newRef = push(ref(db, "users"));
+  const userId = newRef.key;
+  if (!userId) throw new Error("Failed to create user");
+
+  await set(newRef, {
+    name,
+    status: "waiting",
+  });
+
+  localStorage.setItem(STORAGE_KEY_ID, userId);
+  return userId;
+}
 
 export default function ParticipantPage() {
   const [name, setName] = useState("");
   const [inputName, setInputName] = useState("");
   const [isReady, setIsReady] = useState(false);
+  const [isJoining, setIsJoining] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const savedName = localStorage.getItem(STORAGE_KEY);
-    if (savedName) {
-      setName(savedName);
+    async function restore() {
+      const savedName = localStorage.getItem(STORAGE_KEY_NAME);
+      if (!savedName) {
+        setIsReady(true);
+        return;
+      }
+
+      if (isFirebaseConfigured()) {
+        try {
+          await registerParticipant(savedName);
+          setName(savedName);
+        } catch {
+          setError("Firebase への接続に失敗しました。");
+        }
+      } else {
+        setName(savedName);
+        setError("Firebase が未設定のため、モニターに表示されません。");
+      }
+
+      setIsReady(true);
     }
-    setIsReady(true);
+
+    restore();
   }, []);
 
-  const handleJoin = (e: FormEvent<HTMLFormElement>) => {
+  const handleJoin = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const trimmed = inputName.trim();
-    if (!trimmed) return;
+    if (!trimmed || isJoining) return;
 
-    localStorage.setItem(STORAGE_KEY, trimmed);
-    setName(trimmed);
+    setError(null);
+    setIsJoining(true);
+
+    try {
+      if (!isFirebaseConfigured()) {
+        setError("Firebase が未設定です。管理者に連絡してください。");
+        return;
+      }
+
+      await registerParticipant(trimmed);
+      localStorage.setItem(STORAGE_KEY_NAME, trimmed);
+      setName(trimmed);
+    } catch {
+      setError("参加登録に失敗しました。もう一度お試しください。");
+    } finally {
+      setIsJoining(false);
+    }
   };
 
   if (!isReady) {
@@ -63,12 +129,15 @@ export default function ParticipantPage() {
               className="font-serif rounded-lg border border-champagne/40 bg-white/60 px-4 py-3 text-navy outline-none transition-colors placeholder:text-navy/30 focus:border-champagne focus:ring-2 focus:ring-champagne/20"
               autoFocus
             />
+            {error && (
+              <p className="text-center text-sm text-red-600/80">{error}</p>
+            )}
             <button
               type="submit"
-              disabled={!inputName.trim()}
+              disabled={!inputName.trim() || isJoining}
               className="font-serif rounded-lg bg-gradient-to-r from-champagne to-champagne-muted px-4 py-3 font-semibold tracking-wide text-navy transition-all hover:shadow-[0_4px_20px_rgba(212,175,55,0.4)] disabled:cursor-not-allowed disabled:from-navy/20 disabled:to-navy/20 disabled:text-navy/40"
             >
-              参加する
+              {isJoining ? "登録中..." : "参加する"}
             </button>
           </form>
         </main>
@@ -87,6 +156,10 @@ export default function ParticipantPage() {
         <p className="font-display mt-4 text-sm text-navy/50">
           8.<span className="text-champagne font-bold">22</span> 秒チャレンジ
         </p>
+        {error && (
+          <p className="mt-4 text-sm text-red-600/80">{error}</p>
+        )}
+        <p className="font-serif mt-4 text-sm text-navy/40">待機中...</p>
       </main>
     </div>
   );
