@@ -1,26 +1,131 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --beige: #f5f0e8;
+  --beige-deep: #ebe3d5;
+  --navy: #0f1a2e;
+  --navy-light: #1a2d4a;
+  --champagne: #d4af37;
+  --champagne-light: #e8d5a3;
+  --champagne-muted: #c9a962;
+  --foreground: #1a1a1a;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-beige: var(--beige);
+  --color-beige-deep: var(--beige-deep);
+  --color-navy: var(--navy);
+  --color-navy-light: var(--navy-light);
+  --color-champagne: var(--champagne);
+  --color-champagne-light: var(--champagne-light);
+  --color-champagne-muted: var(--champagne-muted);
+  --font-serif: var(--font-noto-serif);
+  --font-display: var(--font-dm-sans);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+@keyframes float-up {
+  from {
+    opacity: 0;
+    transform: translateY(28px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
+@keyframes gentle-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+@keyframes shimmer {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.animate-float-up {
+  animation: float-up 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.animate-gentle-float {
+  animation: gentle-float 4s ease-in-out infinite;
+}
+
+.animate-shimmer {
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+.font-serif {
+  font-family: var(--font-noto-serif), "Hiragino Mincho ProN", serif;
+}
+
+.font-display {
+  font-family: var(--font-dm-sans), system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.luxury-card {
+  background: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.95) 0%,
+    rgba(245, 240, 232, 0.9) 100%
+  );
+  border: 1px solid rgba(212, 175, 55, 0.35);
+  box-shadow:
+    0 4px 24px rgba(15, 26, 46, 0.08),
+    0 1px 0 rgba(255, 255, 255, 0.8) inset;
+}
+
+.luxury-card-dark {
+  background: linear-gradient(
+    145deg,
+    rgba(26, 45, 74, 0.85) 0%,
+    rgba(15, 26, 46, 0.95) 100%
+  );
+  border: 1px solid rgba(212, 175, 55, 0.25);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.35),
+    0 1px 0 rgba(212, 175, 55, 0.12) inset;
+}
+
+.luxury-card-winner {
+  background: linear-gradient(
+    145deg,
+    rgba(212, 175, 55, 0.35) 0%,
+    rgba(26, 45, 74, 0.9) 100%
+  );
+  border: 2px solid var(--champagne);
+  box-shadow:
+    0 0 48px rgba(212, 175, 55, 0.45),
+    0 12px 40px rgba(0, 0, 0, 0.4);
+}
+
+.bg-luxury-beige {
+  background: linear-gradient(160deg, var(--beige) 0%, var(--beige-deep) 100%);
+}
+
+.bg-luxury-navy {
+  background: linear-gradient(160deg, var(--navy) 0%, var(--navy-light) 50%, var(--navy) 100%);
+}
+
+.text-gold-gradient {
+  background: linear-gradient(135deg, var(--champagne-light), var(--champagne));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
 body {
-  background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
 }
