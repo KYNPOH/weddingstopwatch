@@ -3,12 +3,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { onValue, ref, remove, set } from "firebase/database";
 import confetti from "canvas-confetti";
-import { RotateCcw } from "lucide-react";
+import { Play, RotateCcw } from "lucide-react";
 import { getFirebaseDatabase, isFirebaseConfigured } from "@/lib/firebase";
-
-const TARGET_TIME = 8.22;
-
-type UserStatus = "waiting" | "running" | "finished";
+import {
+  TARGET_TIME,
+  formatDiff,
+  formatScore,
+  getCountdownNumber,
+  getEffectivePhase,
+  parseGameData,
+  type GameData,
+  type UserStatus,
+} from "@/lib/game";
 
 type Participant = {
   id: string;
@@ -17,17 +23,7 @@ type Participant = {
   score?: number;
 };
 
-type Phase = "playing" | "aggregating" | "results";
-
-function formatScore(score: number): string {
-  return score.toFixed(2);
-}
-
-function formatDiff(score: number): string {
-  const diff = score - TARGET_TIME;
-  if (diff >= 0) return `+${diff.toFixed(2)}`;
-  return diff.toFixed(2);
-}
+type ResultPhase = "playing" | "aggregating" | "results";
 
 function findWinner(participants: Participant[]): string | null {
   let winnerId: string | null = null;
@@ -82,12 +78,20 @@ function fireConfettiBurst() {
 
 export default function MonitorPage() {
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [phase, setPhase] = useState<Phase>("playing");
+  const [game, setGame] = useState<GameData | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [resultPhase, setResultPhase] = useState<ResultPhase>("playing");
   const [winnerId, setWinnerId] = useState<string | null>(null);
   const [firebaseReady, setFirebaseReady] = useState(isFirebaseConfigured());
   const confettiFiredRef = useRef(false);
   const roundStartedRef = useRef(false);
   const participantsRef = useRef<Participant[]>([]);
+
+  const effectivePhase = getEffectivePhase(game, now);
+  const countdownNumber =
+    effectivePhase === "countdown" && game?.startAt
+      ? getCountdownNumber(game.startAt, now)
+      : null;
 
   useEffect(() => {
     if (!isFirebaseConfigured()) {
@@ -96,12 +100,13 @@ export default function MonitorPage() {
     }
 
     setFirebaseReady(true);
-    const usersRef = ref(getFirebaseDatabase(), "users");
+    const db = getFirebaseDatabase();
 
-    const unsubscribe = onValue(usersRef, (snapshot) => {
+    const unsubUsers = onValue(ref(db, "users"), (snapshot) => {
       const data = snapshot.val();
       if (!data) {
         setParticipants([]);
+        participantsRef.current = [];
         return;
       }
 
@@ -123,8 +128,21 @@ export default function MonitorPage() {
       participantsRef.current = list;
     });
 
-    return () => unsubscribe();
+    const unsubGame = onValue(ref(db, "game"), (snapshot) => {
+      setGame(parseGameData(snapshot.val()));
+    });
+
+    return () => {
+      unsubUsers();
+      unsubGame();
+    };
   }, []);
+
+  useEffect(() => {
+    if (effectivePhase !== "countdown" && effectivePhase !== "running") return;
+    const id = setInterval(() => setNow(Date.now()), 50);
+    return () => clearInterval(id);
+  }, [effectivePhase]);
 
   const allFinished =
     participants.length > 0 &&
@@ -132,7 +150,7 @@ export default function MonitorPage() {
 
   useEffect(() => {
     if (!allFinished) {
-      setPhase("playing");
+      setResultPhase("playing");
       setWinnerId(null);
       confettiFiredRef.current = false;
       roundStartedRef.current = false;
@@ -141,10 +159,10 @@ export default function MonitorPage() {
 
     if (roundStartedRef.current) return;
     roundStartedRef.current = true;
-    setPhase("aggregating");
+    setResultPhase("aggregating");
 
     const timer = setTimeout(() => {
-      setPhase("results");
+      setResultPhase("results");
       setWinnerId(findWinner(participantsRef.current));
     }, 3000);
 
@@ -152,11 +170,24 @@ export default function MonitorPage() {
   }, [allFinished]);
 
   useEffect(() => {
-    if (phase === "results" && winnerId && !confettiFiredRef.current) {
+    if (resultPhase === "results" && winnerId && !confettiFiredRef.current) {
       confettiFiredRef.current = true;
       fireConfettiBurst();
     }
-  }, [phase, winnerId]);
+  }, [resultPhase, winnerId]);
+
+  const handleArmGame = useCallback(async () => {
+    if (!isFirebaseConfigured() || participants.length === 0) return;
+    await set(ref(getFirebaseDatabase(), "game"), { phase: "armed" });
+  }, [participants.length]);
+
+  const handleStartCountdown = useCallback(async () => {
+    if (!isFirebaseConfigured()) return;
+    await set(ref(getFirebaseDatabase(), "game"), {
+      phase: "countdown",
+      startAt: Date.now() + 3000,
+    });
+  }, []);
 
   const handleReset = useCallback(async () => {
     if (!isFirebaseConfigured()) return;
@@ -165,14 +196,20 @@ export default function MonitorPage() {
     const db = getFirebaseDatabase();
     await set(ref(db, "session/id"), Date.now());
     await remove(ref(db, "users"));
+    await remove(ref(db, "game"));
 
-    setPhase("playing");
+    setResultPhase("playing");
     setWinnerId(null);
     confettiFiredRef.current = false;
     roundStartedRef.current = false;
   }, []);
 
-  const showDiff = phase === "results";
+  const showDiff = resultPhase === "results";
+  const canArmGame =
+    effectivePhase === "idle" &&
+    participants.length > 0 &&
+    participants.every((p) => p.status === "waiting");
+  const canStartCountdown = effectivePhase === "armed";
 
   if (!firebaseReady) {
     return (
@@ -224,9 +261,9 @@ export default function MonitorPage() {
         <div className="mx-auto mt-4 h-px w-24 bg-gradient-to-r from-transparent via-champagne to-transparent" />
       </header>
 
-      <main className="px-4 pb-20">
+      <main className="px-4 pb-28">
         {participants.length === 0 ? (
-          <div className="flex h-[60vh] items-center justify-center">
+          <div className="flex h-[50vh] items-center justify-center">
             <p className="font-serif animate-shimmer text-xl text-champagne-light/60">
               参加者を待っています...
             </p>
@@ -235,8 +272,13 @@ export default function MonitorPage() {
           <div className="mx-auto grid max-w-6xl grid-cols-3 gap-3 sm:gap-4">
             {participants.map((p, index) => {
               const isWinner = showDiff && p.id === winnerId;
-              const isRunning = p.status === "running";
               const isFinished = p.status === "finished";
+              const isMeasuring =
+                effectivePhase === "running" && !isFinished;
+              const isPreparing =
+                (effectivePhase === "armed" ||
+                  effectivePhase === "countdown") &&
+                !isFinished;
 
               return (
                 <div
@@ -252,7 +294,7 @@ export default function MonitorPage() {
                     {p.name}
                   </p>
 
-                  {isRunning && (
+                  {isMeasuring && (
                     <p className="font-serif animate-shimmer text-sm text-champagne sm:text-base">
                       計測中...
                     </p>
@@ -279,8 +321,10 @@ export default function MonitorPage() {
                     </>
                   )}
 
-                  {!isRunning && !isFinished && (
-                    <p className="font-serif text-sm text-white/35">待機中...</p>
+                  {!isMeasuring && !isFinished && (
+                    <p className="font-serif text-sm text-white/35">
+                      {isPreparing ? "準備中..." : "待機中..."}
+                    </p>
                   )}
                 </div>
               );
@@ -289,7 +333,15 @@ export default function MonitorPage() {
         )}
       </main>
 
-      {phase === "aggregating" && (
+      {countdownNumber != null && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-navy/60 backdrop-blur-sm">
+          <p className="font-display text-9xl font-bold text-champagne-light sm:text-[12rem]">
+            {countdownNumber}
+          </p>
+        </div>
+      )}
+
+      {resultPhase === "aggregating" && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-navy/85 backdrop-blur-md">
           <div className="animate-float-up text-center">
             <p className="font-display text-5xl font-bold tracking-wider text-champagne-light sm:text-7xl">
@@ -302,15 +354,38 @@ export default function MonitorPage() {
         </div>
       )}
 
-      <button
-        type="button"
-        onClick={handleReset}
-        className="fixed bottom-4 right-4 flex items-center gap-2 rounded-lg border border-champagne/20 bg-navy-light/80 px-3 py-2 text-xs text-white/40 backdrop-blur transition-colors hover:border-champagne/50 hover:text-champagne-light sm:text-sm"
-        title="全データリセット"
-      >
-        <RotateCcw className="h-4 w-4" />
-        リセット
-      </button>
+      <div className="fixed bottom-4 left-4 right-4 flex items-center justify-between gap-3">
+        <div className="flex gap-2">
+          {canArmGame && (
+            <button
+              type="button"
+              onClick={handleArmGame}
+              className="font-serif flex items-center gap-2 rounded-lg border border-champagne/40 bg-champagne/20 px-4 py-2 text-sm text-champagne-light transition-colors hover:bg-champagne/30"
+            >
+              <Play className="h-4 w-4" />
+              ゲーム開始
+            </button>
+          )}
+          {canStartCountdown && (
+            <button
+              type="button"
+              onClick={handleStartCountdown}
+              className="font-serif flex items-center gap-2 rounded-lg border border-champagne bg-champagne px-4 py-2 text-sm font-semibold text-navy transition-colors hover:bg-champagne-light"
+            >
+              スタート
+            </button>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={handleReset}
+          className="flex items-center gap-2 rounded-lg border border-champagne/20 bg-navy-light/80 px-3 py-2 text-xs text-white/40 backdrop-blur transition-colors hover:border-champagne/50 hover:text-champagne-light sm:text-sm"
+          title="全データリセット"
+        >
+          <RotateCcw className="h-4 w-4" />
+          リセット
+        </button>
+      </div>
     </div>
   );
 }
