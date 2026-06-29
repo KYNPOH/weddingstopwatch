@@ -1,24 +1,33 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
-import { get, push, ref, set } from "firebase/database";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import { get, onValue, push, ref, remove, set } from "firebase/database";
 import { getFirebaseDatabase, isFirebaseConfigured } from "@/lib/firebase";
 
 const STORAGE_KEY_NAME = "participantName";
 const STORAGE_KEY_ID = "participantId";
+const STORAGE_KEY_SESSION = "participantSession";
 
-async function registerParticipant(name: string): Promise<string> {
+function clearParticipantStorage() {
+  localStorage.removeItem(STORAGE_KEY_NAME);
+  localStorage.removeItem(STORAGE_KEY_ID);
+  localStorage.removeItem(STORAGE_KEY_SESSION);
+}
+
+async function getCurrentSession(): Promise<string> {
+  const snap = await get(ref(getFirebaseDatabase(), "session/id"));
+  return String(snap.val() ?? 0);
+}
+
+async function joinAsParticipant(name: string): Promise<void> {
   const db = getFirebaseDatabase();
-  const savedId = localStorage.getItem(STORAGE_KEY_ID);
+  const oldId = localStorage.getItem(STORAGE_KEY_ID);
 
-  if (savedId) {
-    const snapshot = await get(ref(db, `users/${savedId}`));
-    if (snapshot.exists()) {
-      await set(ref(db, `users/${savedId}`), {
-        name,
-        status: "waiting",
-      });
-      return savedId;
+  if (oldId) {
+    try {
+      await remove(ref(db, `users/${oldId}`));
+    } catch {
+      // 既に削除済みの場合は無視
     }
   }
 
@@ -26,13 +35,25 @@ async function registerParticipant(name: string): Promise<string> {
   const userId = newRef.key;
   if (!userId) throw new Error("Failed to create user");
 
-  await set(newRef, {
-    name,
-    status: "waiting",
-  });
+  const sessionId = await getCurrentSession();
 
+  await set(newRef, { name, status: "waiting" });
+
+  localStorage.setItem(STORAGE_KEY_NAME, name);
   localStorage.setItem(STORAGE_KEY_ID, userId);
-  return userId;
+  localStorage.setItem(STORAGE_KEY_SESSION, sessionId);
+}
+
+async function leaveParticipant(): Promise<void> {
+  const savedId = localStorage.getItem(STORAGE_KEY_ID);
+  if (savedId && isFirebaseConfigured()) {
+    try {
+      await remove(ref(getFirebaseDatabase(), `users/${savedId}`));
+    } catch {
+      // 既に削除済みの場合は無視
+    }
+  }
+  clearParticipantStorage();
 }
 
 export default function ParticipantPage() {
@@ -40,26 +61,53 @@ export default function ParticipantPage() {
   const [inputName, setInputName] = useState("");
   const [isReady, setIsReady] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
+  const [isLeaving, setIsLeaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const resetToRegistration = useCallback(() => {
+    clearParticipantStorage();
+    setName("");
+    setInputName("");
+    setError(null);
+  }, []);
 
   useEffect(() => {
     async function restore() {
       const savedName = localStorage.getItem(STORAGE_KEY_NAME);
-      if (!savedName) {
+      const savedId = localStorage.getItem(STORAGE_KEY_ID);
+      const savedSession = localStorage.getItem(STORAGE_KEY_SESSION);
+
+      if (!savedName || !savedId || !savedSession) {
+        clearParticipantStorage();
         setIsReady(true);
         return;
       }
 
-      if (isFirebaseConfigured()) {
-        try {
-          await registerParticipant(savedName);
-          setName(savedName);
-        } catch {
-          setError("Firebase への接続に失敗しました。");
-        }
-      } else {
-        setName(savedName);
+      if (!isFirebaseConfigured()) {
         setError("Firebase が未設定のため、モニターに表示されません。");
+        setIsReady(true);
+        return;
+      }
+
+      try {
+        const db = getFirebaseDatabase();
+        const [sessionSnap, userSnap] = await Promise.all([
+          get(ref(db, "session/id")),
+          get(ref(db, `users/${savedId}`)),
+        ]);
+
+        const currentSession = String(sessionSnap.val() ?? 0);
+
+        if (savedSession !== currentSession || !userSnap.exists()) {
+          clearParticipantStorage();
+          setIsReady(true);
+          return;
+        }
+
+        setName(userSnap.val()?.name ?? savedName);
+      } catch {
+        clearParticipantStorage();
+        setError("Firebase への接続に失敗しました。");
       }
 
       setIsReady(true);
@@ -67,6 +115,22 @@ export default function ParticipantPage() {
 
     restore();
   }, []);
+
+  useEffect(() => {
+    if (!isFirebaseConfigured() || !name) return;
+
+    const sessionRef = ref(getFirebaseDatabase(), "session/id");
+    const unsubscribe = onValue(sessionRef, (snapshot) => {
+      const currentSession = String(snapshot.val() ?? 0);
+      const savedSession = localStorage.getItem(STORAGE_KEY_SESSION);
+
+      if (savedSession && savedSession !== currentSession) {
+        resetToRegistration();
+      }
+    });
+
+    return () => unsubscribe();
+  }, [name, resetToRegistration]);
 
   const handleJoin = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -82,13 +146,26 @@ export default function ParticipantPage() {
         return;
       }
 
-      await registerParticipant(trimmed);
-      localStorage.setItem(STORAGE_KEY_NAME, trimmed);
+      await joinAsParticipant(trimmed);
       setName(trimmed);
     } catch {
       setError("参加登録に失敗しました。もう一度お試しください。");
     } finally {
       setIsJoining(false);
+    }
+  };
+
+  const handleRetry = async () => {
+    if (isLeaving) return;
+    setIsLeaving(true);
+
+    try {
+      await leaveParticipant();
+      resetToRegistration();
+    } catch {
+      setError("やり直しに失敗しました。もう一度お試しください。");
+    } finally {
+      setIsLeaving(false);
     }
   };
 
@@ -160,6 +237,14 @@ export default function ParticipantPage() {
           <p className="mt-4 text-sm text-red-600/80">{error}</p>
         )}
         <p className="font-serif mt-4 text-sm text-navy/40">待機中...</p>
+        <button
+          type="button"
+          onClick={handleRetry}
+          disabled={isLeaving}
+          className="font-serif mt-8 text-sm text-navy/45 underline decoration-champagne/50 underline-offset-4 transition-colors hover:text-champagne-muted disabled:opacity-50"
+        >
+          {isLeaving ? "処理中..." : "名前をやり直す"}
+        </button>
       </main>
     </div>
   );

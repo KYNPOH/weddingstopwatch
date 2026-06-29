@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { onValue, ref, remove } from "firebase/database";
+import { onValue, ref, remove, set } from "firebase/database";
 import confetti from "canvas-confetti";
 import { RotateCcw } from "lucide-react";
 import { getFirebaseDatabase, isFirebaseConfigured } from "@/lib/firebase";
@@ -161,7 +161,11 @@ export default function MonitorPage() {
   const handleReset = useCallback(async () => {
     if (!isFirebaseConfigured()) return;
     if (!window.confirm("全員のデータをリセットしますか？")) return;
-    await remove(ref(getFirebaseDatabase(), "users"));
+
+    const db = getFirebaseDatabase();
+    await set(ref(db, "session/id"), Date.now());
+    await remove(ref(db, "users"));
+
     setPhase("playing");
     setWinnerId(null);
     confettiFiredRef.current = false;
