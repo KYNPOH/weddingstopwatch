@@ -1,44 +1,75 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onValue, ref, remove, set } from "firebase/database";
 import confetti from "canvas-confetti";
 import { Play, RotateCcw } from "lucide-react";
 import { getFirebaseDatabase, isFirebaseConfigured } from "@/lib/firebase";
 import {
-  TARGET_TIME,
+  TABLES,
+  buildRankings,
   formatDiff,
-  formatScore,
+  formatJapaneseTime,
+  formatRankAnnouncement,
   getCountdownNumber,
   getEffectivePhase,
+  getParticipantByRank,
+  isTableId,
   parseGameData,
   type GameData,
+  type Participant,
+  type RankedParticipant,
+  type TableId,
   type UserStatus,
 } from "@/lib/game";
 
-type Participant = {
-  id: string;
-  name: string;
-  status: UserStatus;
-  score?: number;
+type ResultPhase = "playing" | "aggregating" | "announcing" | "done";
+type TitlePhase = "hidden" | "center" | "top";
+
+type RankLine = {
+  key: number;
+  text: string;
+  ranks: number[];
+  emphasis?: boolean;
 };
 
-type ResultPhase = "playing" | "aggregating" | "results";
+const RANK_REVEAL_MS = 2500;
+const PAUSE_BEFORE_THIRD_MS = 1800;
+const PAUSE_BEFORE_TOP_MS = 2200;
+const INTRO_CENTER_MS = 1800;
+const INTRO_MOVE_MS = 1200;
+const TOP_REVEAL_MS = 4500;
+const AGGREGATING_MS = 5000;
 
-function findWinner(participants: Participant[]): string | null {
-  let winnerId: string | null = null;
-  let bestDiff = Infinity;
+function parseParticipant(id: string, value: unknown): Participant | null {
+  const user = value as {
+    name?: string;
+    table?: string;
+    status?: UserStatus;
+    score?: number;
+  };
+  if (!user.table || !isTableId(user.table)) return null;
+  return {
+    id,
+    name: user.name ?? "名無し",
+    table: user.table,
+    status: user.status ?? "waiting",
+    score: user.score,
+  };
+}
 
-  for (const p of participants) {
-    if (p.status !== "finished" || p.score == null) continue;
-    const diff = Math.abs(p.score - TARGET_TIME);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      winnerId = p.id;
-    }
-  }
-
-  return winnerId;
+function RankRevealLine({ line }: { line: RankLine }) {
+  return (
+    <p
+      className={`animate-slide-in-right w-full overflow-hidden text-center font-serif leading-relaxed ${
+        line.emphasis
+          ? "text-xl text-champagne-light sm:text-3xl"
+          : "text-base text-white/90 sm:text-xl"
+      }`}
+    >
+      {line.text}
+    </p>
+  );
 }
 
 function fireConfettiBurst() {
@@ -81,17 +112,51 @@ export default function MonitorPage() {
   const [game, setGame] = useState<GameData | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [resultPhase, setResultPhase] = useState<ResultPhase>("playing");
-  const [winnerId, setWinnerId] = useState<string | null>(null);
+  const [titlePhase, setTitlePhase] = useState<TitlePhase>("hidden");
+  const [rankLines, setRankLines] = useState<RankLine[]>([]);
+  const [highlightedRanks, setHighlightedRanks] = useState<Set<number>>(
+    new Set()
+  );
   const [firebaseReady, setFirebaseReady] = useState(isFirebaseConfigured());
-  const confettiFiredRef = useRef(false);
   const roundStartedRef = useRef(false);
   const participantsRef = useRef<Participant[]>([]);
+  const announceAbortRef = useRef(false);
+  const lineKeyRef = useRef(0);
+  const confettiFiredRef = useRef(false);
 
   const effectivePhase = getEffectivePhase(game, now);
   const countdownNumber =
     effectivePhase === "countdown" && game?.startAt
       ? getCountdownNumber(game.startAt, now)
       : null;
+
+  const participantsByTable = participants.reduce<
+    Record<TableId, Participant | undefined>
+  >(
+    (acc, p) => {
+      acc[p.table] = p;
+      return acc;
+    },
+    {} as Record<TableId, Participant | undefined>
+  );
+
+  const rankings = useMemo(() => buildRankings(participants), [participants]);
+  const rankByParticipantId = useMemo(
+    () => new Map(rankings.map((r) => [r.id, r.rank])),
+    [rankings]
+  );
+
+  const pushRankLine = useCallback(
+    (text: string, ranks: number[], emphasis = false) => {
+      lineKeyRef.current += 1;
+      setRankLines((prev) => [
+        ...prev,
+        { key: lineKeyRef.current, text, ranks, emphasis },
+      ]);
+      setHighlightedRanks((prev) => new Set([...prev, ...ranks]));
+    },
+    []
+  );
 
   useEffect(() => {
     if (!isFirebaseConfigured()) {
@@ -110,19 +175,9 @@ export default function MonitorPage() {
         return;
       }
 
-      const list: Participant[] = Object.entries(data).map(([id, value]) => {
-        const user = value as {
-          name?: string;
-          status?: UserStatus;
-          score?: number;
-        };
-        return {
-          id,
-          name: user.name ?? "名無し",
-          status: user.status ?? "waiting",
-          score: user.score,
-        };
-      });
+      const list = Object.entries(data)
+        .map(([id, value]) => parseParticipant(id, value))
+        .filter((p): p is Participant => p !== null);
 
       setParticipants(list);
       participantsRef.current = list;
@@ -148,33 +203,101 @@ export default function MonitorPage() {
     participants.length > 0 &&
     participants.every((p) => p.status === "finished");
 
+  const resetAnnouncement = useCallback(() => {
+    announceAbortRef.current = true;
+    setResultPhase("playing");
+    setTitlePhase("hidden");
+    setRankLines([]);
+    setHighlightedRanks(new Set());
+    lineKeyRef.current = 0;
+    confettiFiredRef.current = false;
+    roundStartedRef.current = false;
+  }, []);
+
   useEffect(() => {
     if (!allFinished) {
-      setResultPhase("playing");
-      setWinnerId(null);
-      confettiFiredRef.current = false;
-      roundStartedRef.current = false;
+      resetAnnouncement();
       return;
     }
 
     if (roundStartedRef.current) return;
     roundStartedRef.current = true;
-    setResultPhase("aggregating");
+    announceAbortRef.current = false;
 
-    const timer = setTimeout(() => {
-      setResultPhase("results");
-      setWinnerId(findWinner(participantsRef.current));
-    }, 3000);
+    const wait = (ms: number) =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, ms);
+      });
 
-    return () => clearTimeout(timer);
-  }, [allFinished]);
-
-  useEffect(() => {
-    if (resultPhase === "results" && winnerId && !confettiFiredRef.current) {
-      confettiFiredRef.current = true;
-      fireConfettiBurst();
+    async function revealRank(p: RankedParticipant, emphasis = false) {
+      pushRankLine(formatRankAnnouncement(p), [p.rank], emphasis);
+      await wait(emphasis ? RANK_REVEAL_MS + 800 : RANK_REVEAL_MS);
     }
-  }, [resultPhase, winnerId]);
+
+    async function runAnnouncement() {
+      setResultPhase("aggregating");
+      setTitlePhase("hidden");
+      setRankLines([]);
+      await wait(AGGREGATING_MS);
+      if (announceAbortRef.current) return;
+
+      setResultPhase("announcing");
+      setTitlePhase("center");
+      await wait(INTRO_CENTER_MS);
+      if (announceAbortRef.current) return;
+
+      setTitlePhase("top");
+      await wait(INTRO_MOVE_MS);
+      if (announceAbortRef.current) return;
+
+      const currentRankings = buildRankings(participantsRef.current);
+      const total = currentRankings.length;
+      if (total === 0) {
+        setResultPhase("done");
+        return;
+      }
+
+      for (let rank = total; rank >= 4; rank--) {
+        const p = getParticipantByRank(currentRankings, rank);
+        if (!p) continue;
+        await revealRank(p);
+        if (announceAbortRef.current) return;
+      }
+
+      if (total >= 3) {
+        await wait(PAUSE_BEFORE_THIRD_MS);
+        if (announceAbortRef.current) return;
+        const third = getParticipantByRank(currentRankings, 3)!;
+        await revealRank(third, true);
+        if (announceAbortRef.current) return;
+      }
+
+      if (total >= 2) {
+        await wait(PAUSE_BEFORE_TOP_MS);
+        if (announceAbortRef.current) return;
+        const second = getParticipantByRank(currentRankings, 2)!;
+        const first = getParticipantByRank(currentRankings, 1)!;
+        pushRankLine(formatRankAnnouncement(second), [2], true);
+        await wait(180);
+        if (announceAbortRef.current) return;
+        pushRankLine(formatRankAnnouncement(first), [1], true);
+        await wait(TOP_REVEAL_MS);
+        if (announceAbortRef.current) return;
+      } else if (total === 1) {
+        const first = getParticipantByRank(currentRankings, 1)!;
+        await revealRank(first, true);
+        if (announceAbortRef.current) return;
+      }
+
+      setResultPhase("done");
+      if (!confettiFiredRef.current) {
+        confettiFiredRef.current = true;
+        fireConfettiBurst();
+      }
+    }
+
+    runAnnouncement();
+  }, [allFinished, pushRankLine, resetAnnouncement]);
 
   const handleArmGame = useCallback(async () => {
     if (!isFirebaseConfigured() || participants.length === 0) return;
@@ -193,23 +316,22 @@ export default function MonitorPage() {
     if (!isFirebaseConfigured()) return;
     if (!window.confirm("全員のデータをリセットしますか？")) return;
 
+    resetAnnouncement();
+
     const db = getFirebaseDatabase();
     await set(ref(db, "session/id"), Date.now());
     await remove(ref(db, "users"));
     await remove(ref(db, "game"));
+  }, [resetAnnouncement]);
 
-    setResultPhase("playing");
-    setWinnerId(null);
-    confettiFiredRef.current = false;
-    roundStartedRef.current = false;
-  }, []);
-
-  const showDiff = resultPhase === "results";
   const canArmGame =
     effectivePhase === "idle" &&
     participants.length > 0 &&
     participants.every((p) => p.status === "waiting");
   const canStartCountdown = effectivePhase === "armed";
+  const showAggregating = resultPhase === "aggregating";
+  const showResultOverlay =
+    resultPhase === "announcing" || resultPhase === "done";
 
   if (!firebaseReady) {
     return (
@@ -223,114 +345,91 @@ export default function MonitorPage() {
             <code className="text-champagne-light">.env.local</code>{" "}
             を作成し、Firebase コンソールの設定値を入力してください。
           </p>
-          <ol className="mt-4 list-decimal space-y-2 pl-5 text-sm text-white/50">
-            <li>
-              <code className="text-white/70">.env.local.example</code> を{" "}
-              <code className="text-white/70">.env.local</code> にコピー
-            </li>
-            <li>Firebase コンソール → プロジェクト設定 → マイアプリ から各値を取得</li>
-            <li>
-              Realtime Database を有効化し、{" "}
-              <code className="text-white/70">NEXT_PUBLIC_FIREBASE_DATABASE_URL</code>{" "}
-              を設定
-            </li>
-            <li>
-              開発サーバーを再起動（<code className="text-white/70">npm run dev</code>）
-            </li>
-          </ol>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="bg-luxury-navy relative min-h-screen text-white">
-      <header className="px-6 py-6 text-center">
+    <div className="bg-luxury-navy relative min-h-screen overflow-x-hidden text-white">
+      <header className="px-4 py-4 text-center sm:px-6 sm:py-5">
         <p className="font-serif text-xs tracking-[0.35em] text-champagne-muted uppercase">
           Wedding Celebration
         </p>
-        <h1 className="font-serif mt-2 text-3xl font-semibold tracking-wide sm:text-4xl">
+        <h1 className="font-serif mt-1 text-2xl font-semibold tracking-wide sm:text-3xl">
           <span className="text-gold-gradient">8.22</span>
           <span className="text-white">秒チャレンジ</span>
         </h1>
-        <p className="font-display mt-2 text-sm text-champagne-light/70">
-          目標{" "}
-          <span className="font-bold text-champagne">{TARGET_TIME.toFixed(2)}</span>{" "}
-          秒に最も近い人が勝利
-        </p>
-        <div className="mx-auto mt-4 h-px w-24 bg-gradient-to-r from-transparent via-champagne to-transparent" />
+        <div className="mx-auto mt-3 h-px w-24 bg-gradient-to-r from-transparent via-champagne to-transparent" />
       </header>
 
-      <main className="px-4 pb-28">
-        {participants.length === 0 ? (
-          <div className="flex h-[50vh] items-center justify-center">
-            <p className="font-serif animate-shimmer text-xl text-champagne-light/60">
-              参加者を待っています...
-            </p>
-          </div>
-        ) : (
-          <div className="mx-auto grid max-w-6xl grid-cols-3 gap-3 sm:gap-4">
-            {participants.map((p, index) => {
-              const isWinner = showDiff && p.id === winnerId;
-              const isFinished = p.status === "finished";
-              const isMeasuring =
-                effectivePhase === "running" && !isFinished;
-              const isPreparing =
-                (effectivePhase === "armed" ||
-                  effectivePhase === "countdown") &&
-                !isFinished;
+      <main className="px-3 pb-28 sm:px-4">
+        <div className="mx-auto grid max-w-6xl grid-cols-4 gap-2 sm:gap-3">
+          {TABLES.map((tableId, index) => {
+            const p = participantsByTable[tableId];
+            const isFinished = p?.status === "finished";
+            const isMeasuring =
+              !!p && effectivePhase === "running" && !isFinished;
+            const isPreparing =
+              !!p &&
+              (effectivePhase === "armed" || effectivePhase === "countdown") &&
+              !isFinished;
+            const rank = p ? rankByParticipantId.get(p.id) : undefined;
+            const isHighlighted =
+              rank != null && highlightedRanks.has(rank);
 
-              return (
-                <div
-                  key={p.id}
-                  style={{ animationDelay: `${index * 80}ms` }}
-                  className={`animate-float-up flex flex-col items-center justify-center rounded-xl px-3 py-4 transition-all duration-700 sm:px-4 sm:py-6 ${
-                    isWinner
-                      ? "luxury-card-winner animate-gentle-float z-10 scale-110"
-                      : "luxury-card-dark"
-                  }`}
-                >
-                  <p className="font-serif mb-2 truncate text-base font-semibold text-champagne-light sm:text-lg">
-                    {p.name}
-                  </p>
+            return (
+              <div
+                key={tableId}
+                style={{ animationDelay: `${index * 50}ms` }}
+                className={`animate-float-up luxury-card-dark flex min-h-[88px] flex-col justify-center rounded-xl px-2 py-3 transition-all duration-500 sm:min-h-[100px] sm:px-3 ${
+                  isHighlighted
+                    ? "ring-2 ring-champagne shadow-[0_0_24px_rgba(212,175,55,0.35)]"
+                    : ""
+                }`}
+              >
+                <p className="font-display text-xs text-champagne-muted sm:text-sm">
+                  {tableId}卓
+                </p>
 
-                  {isMeasuring && (
-                    <p className="font-serif animate-shimmer text-sm text-champagne sm:text-base">
-                      計測中...
+                {!p && (
+                  <p className="font-serif mt-1 text-sm text-white/20">—</p>
+                )}
+
+                {p && (
+                  <>
+                    <p className="font-serif mt-1 truncate text-sm font-semibold text-champagne-light sm:text-base">
+                      {p.name}
                     </p>
-                  )}
 
-                  {isFinished && p.score != null && (
-                    <>
-                      <p
-                        className={`font-display text-lg font-bold sm:text-xl ${
-                          isWinner ? "text-champagne-light" : "text-white/90"
-                        }`}
-                      >
-                        スコア（{formatScore(p.score)}）
+                    {isMeasuring && (
+                      <p className="font-serif animate-shimmer mt-1 text-xs text-champagne sm:text-sm">
+                        計測中...
                       </p>
-                      {showDiff && (
-                        <p
-                          className={`font-display mt-1 text-sm sm:text-base ${
-                            isWinner ? "text-champagne" : "text-white/45"
-                          }`}
-                        >
+                    )}
+
+                    {isFinished && p.score != null && (
+                      <div className="mt-1">
+                        <p className="font-display text-base font-bold text-white sm:text-lg">
+                          {formatJapaneseTime(p.score)}
+                        </p>
+                        <p className="font-display text-xs text-champagne-light/70 sm:text-sm">
                           {formatDiff(p.score)}
                         </p>
-                      )}
-                    </>
-                  )}
+                      </div>
+                    )}
 
-                  {!isMeasuring && !isFinished && (
-                    <p className="font-serif text-sm text-white/35">
-                      {isPreparing ? "準備中..." : "待機中..."}
-                    </p>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
+                    {!isMeasuring && !isFinished && (
+                      <p className="font-serif mt-1 text-xs text-white/35">
+                        {isPreparing ? "準備中..." : "待機中..."}
+                      </p>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </main>
 
       {countdownNumber != null && (
@@ -341,20 +440,42 @@ export default function MonitorPage() {
         </div>
       )}
 
-      {resultPhase === "aggregating" && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-navy/85 backdrop-blur-md">
-          <div className="animate-float-up text-center">
-            <p className="font-display text-5xl font-bold tracking-wider text-champagne-light sm:text-7xl">
+      {showAggregating && (
+        <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center px-4">
+          <div className="animate-slow-blink text-center">
+            <p className="font-display text-4xl font-bold tracking-wider text-champagne-light drop-shadow-lg sm:text-6xl">
               FINISH!!
             </p>
-            <p className="font-serif mt-4 text-2xl text-white/80 sm:text-4xl">
+            <p className="font-serif mt-2 text-xl text-white/90 drop-shadow-lg sm:text-3xl">
               集計中...
             </p>
           </div>
         </div>
       )}
 
-      <div className="fixed bottom-4 left-4 right-4 flex items-center justify-between gap-3">
+      {showResultOverlay && titlePhase !== "hidden" && (
+        <div className="pointer-events-none fixed inset-0 z-50 overflow-hidden bg-navy/92 backdrop-blur-md">
+          <p
+            className={`announce-title-motion font-serif absolute left-1/2 -translate-x-1/2 font-semibold text-champagne-light drop-shadow-[0_4px_24px_rgba(0,0,0,0.45)] ${
+              titlePhase === "center"
+                ? "top-1/2 -translate-y-1/2 text-5xl tracking-wide sm:text-7xl"
+                : "top-14 translate-y-0 text-xl tracking-[0.35em] sm:text-3xl"
+            }`}
+          >
+            結果発表！
+          </p>
+
+          <div className="scrollbar-hide absolute inset-x-0 top-28 flex max-h-[calc(100vh-8rem)] flex-col items-center overflow-x-hidden overflow-y-auto px-6 sm:top-32 sm:px-12">
+            <div className="flex w-full max-w-4xl flex-col items-center gap-3 sm:gap-4">
+              {rankLines.map((line) => (
+                <RankRevealLine key={line.key} line={line} />
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="fixed bottom-4 left-4 right-4 z-[60] flex items-center justify-between gap-3">
         <div className="flex gap-2">
           {canArmGame && (
             <button

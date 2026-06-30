@@ -4,23 +4,29 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import { get, onValue, push, ref, remove, set, update } from "firebase/database";
 import { getFirebaseDatabase, isFirebaseConfigured } from "@/lib/firebase";
 import {
+  TABLES,
+  formatJapaneseTime,
   formatScore,
   getCountdownNumber,
   getEffectivePhase,
   getElapsedSeconds,
   isRegistrationOpen,
+  isTableId,
   parseGameData,
   type GameData,
+  type TableId,
 } from "@/lib/game";
 
 const STORAGE_KEY_NAME = "participantName";
 const STORAGE_KEY_ID = "participantId";
 const STORAGE_KEY_SESSION = "participantSession";
+const STORAGE_KEY_TABLE = "participantTable";
 
 function clearParticipantStorage() {
   localStorage.removeItem(STORAGE_KEY_NAME);
   localStorage.removeItem(STORAGE_KEY_ID);
   localStorage.removeItem(STORAGE_KEY_SESSION);
+  localStorage.removeItem(STORAGE_KEY_TABLE);
 }
 
 async function getCurrentSession(): Promise<string> {
@@ -33,7 +39,18 @@ async function fetchGameData(): Promise<GameData | null> {
   return parseGameData(snap.val());
 }
 
-async function joinAsParticipant(name: string): Promise<void> {
+async function isTableTaken(table: TableId, excludeId?: string): Promise<boolean> {
+  const snap = await get(ref(getFirebaseDatabase(), "users"));
+  const data = snap.val();
+  if (!data) return false;
+
+  return Object.entries(data).some(([id, value]) => {
+    if (excludeId && id === excludeId) return false;
+    return (value as { table?: string }).table === table;
+  });
+}
+
+async function joinAsParticipant(name: string, table: TableId): Promise<void> {
   const game = await fetchGameData();
   if (!isRegistrationOpen(game)) {
     throw new Error("GAME_IN_PROGRESS");
@@ -41,6 +58,10 @@ async function joinAsParticipant(name: string): Promise<void> {
 
   const db = getFirebaseDatabase();
   const oldId = localStorage.getItem(STORAGE_KEY_ID);
+
+  if (await isTableTaken(table, oldId ?? undefined)) {
+    throw new Error("TABLE_TAKEN");
+  }
 
   if (oldId) {
     try {
@@ -56,11 +77,12 @@ async function joinAsParticipant(name: string): Promise<void> {
 
   const sessionId = await getCurrentSession();
 
-  await set(newRef, { name, status: "waiting" });
+  await set(newRef, { name, table, status: "waiting" });
 
   localStorage.setItem(STORAGE_KEY_NAME, name);
   localStorage.setItem(STORAGE_KEY_ID, userId);
   localStorage.setItem(STORAGE_KEY_SESSION, sessionId);
+  localStorage.setItem(STORAGE_KEY_TABLE, table);
 }
 
 async function leaveParticipant(): Promise<void> {
@@ -77,7 +99,10 @@ async function leaveParticipant(): Promise<void> {
 
 export default function ParticipantPage() {
   const [name, setName] = useState("");
+  const [table, setTable] = useState<TableId | null>(null);
   const [inputName, setInputName] = useState("");
+  const [selectedTable, setSelectedTable] = useState<TableId | null>(null);
+  const [occupiedTables, setOccupiedTables] = useState<Set<TableId>>(new Set());
   const [userId, setUserId] = useState<string | null>(null);
   const [userStatus, setUserStatus] = useState<"waiting" | "finished">("waiting");
   const [score, setScore] = useState<number | null>(null);
@@ -113,7 +138,9 @@ export default function ParticipantPage() {
   const resetToRegistration = useCallback(() => {
     clearParticipantStorage();
     setName("");
+    setTable(null);
     setInputName("");
+    setSelectedTable(null);
     setUserId(null);
     setUserStatus("waiting");
     setScore(null);
@@ -125,8 +152,9 @@ export default function ParticipantPage() {
       const savedName = localStorage.getItem(STORAGE_KEY_NAME);
       const savedId = localStorage.getItem(STORAGE_KEY_ID);
       const savedSession = localStorage.getItem(STORAGE_KEY_SESSION);
+      const savedTable = localStorage.getItem(STORAGE_KEY_TABLE);
 
-      if (!savedName || !savedId || !savedSession) {
+      if (!savedName || !savedId || !savedSession || !savedTable || !isTableId(savedTable)) {
         clearParticipantStorage();
         setIsReady(true);
         return;
@@ -156,6 +184,7 @@ export default function ParticipantPage() {
 
         const user = userSnap.val();
         setName(user?.name ?? savedName);
+        setTable(isTableId(user?.table) ? user.table : savedTable);
         setUserId(savedId);
         setUserStatus(user?.status === "finished" ? "finished" : "waiting");
         if (user?.score != null) setScore(user.score);
@@ -186,6 +215,17 @@ export default function ParticipantPage() {
       onValue(ref(db, "game"), (snapshot) => {
         setGame(parseGameData(snapshot.val()));
       }),
+      onValue(ref(db, "users"), (snapshot) => {
+        const data = snapshot.val();
+        const taken = new Set<TableId>();
+        if (data) {
+          for (const value of Object.values(data)) {
+            const t = (value as { table?: string }).table;
+            if (t && isTableId(t)) taken.add(t);
+          }
+        }
+        setOccupiedTables(taken);
+      }),
     ];
 
     return () => unsubscribers.forEach((unsub) => unsub());
@@ -202,6 +242,7 @@ export default function ParticipantPage() {
       }
       const user = snapshot.val();
       setName(user?.name ?? "");
+      if (user?.table && isTableId(user.table)) setTable(user.table);
       setUserStatus(user?.status === "finished" ? "finished" : "waiting");
       setScore(user?.score ?? null);
     });
@@ -219,7 +260,7 @@ export default function ParticipantPage() {
   const handleJoin = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const trimmed = inputName.trim();
-    if (!trimmed || isJoining) return;
+    if (!trimmed || !selectedTable || isJoining) return;
 
     setError(null);
     setIsJoining(true);
@@ -230,14 +271,17 @@ export default function ParticipantPage() {
         return;
       }
 
-      await joinAsParticipant(trimmed);
+      await joinAsParticipant(trimmed, selectedTable);
       setName(trimmed);
+      setTable(selectedTable);
       setUserId(localStorage.getItem(STORAGE_KEY_ID));
       setUserStatus("waiting");
       setScore(null);
     } catch (err) {
       if (err instanceof Error && err.message === "GAME_IN_PROGRESS") {
         setError("現在ゲーム中です。次のラウンドをお待ちください。");
+      } else if (err instanceof Error && err.message === "TABLE_TAKEN") {
+        setError("この卓は既に選ばれています。別の卓を選んでください。");
       } else {
         setError("参加登録に失敗しました。もう一度お試しください。");
       }
@@ -295,12 +339,12 @@ export default function ParticipantPage() {
     const gameInProgress = game !== null;
 
     return (
-      <div className="bg-luxury-beige flex min-h-screen items-center justify-center px-4">
+      <div className="bg-luxury-beige flex min-h-screen items-center justify-center px-4 py-8">
         <main className="luxury-card animate-float-up w-full max-w-sm rounded-2xl p-8 sm:p-10">
           <p className="font-serif text-center text-xs tracking-[0.3em] text-champagne-muted uppercase">
             Wedding Game
           </p>
-          <h1 className="font-serif mt-2 mb-8 text-center text-2xl font-semibold text-navy">
+          <h1 className="font-serif mt-2 mb-6 text-center text-2xl font-semibold text-navy">
             {gameInProgress ? "参加受付終了" : "参加登録"}
           </h1>
           {gameInProgress ? (
@@ -327,12 +371,38 @@ export default function ParticipantPage() {
                 className="font-serif rounded-lg border border-champagne/40 bg-white/60 px-4 py-3 text-navy outline-none transition-colors placeholder:text-navy/30 focus:border-champagne focus:ring-2 focus:ring-champagne/20"
                 autoFocus
               />
+              <div>
+                <p className="font-serif mb-3 text-sm text-navy/70">卓を選択</p>
+                <div className="grid grid-cols-4 gap-2">
+                  {TABLES.map((t) => {
+                    const taken = occupiedTables.has(t);
+                    const selected = selectedTable === t;
+                    return (
+                      <button
+                        key={t}
+                        type="button"
+                        disabled={taken}
+                        onClick={() => setSelectedTable(t)}
+                        className={`font-display rounded-lg border py-2 text-sm font-semibold transition-all ${
+                          taken
+                            ? "cursor-not-allowed border-navy/10 bg-navy/5 text-navy/25"
+                            : selected
+                              ? "border-champagne bg-champagne/30 text-navy"
+                              : "border-champagne/30 bg-white/50 text-navy hover:border-champagne"
+                        }`}
+                      >
+                        {t}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
               {error && (
                 <p className="text-center text-sm text-red-600/80">{error}</p>
               )}
               <button
                 type="submit"
-                disabled={!inputName.trim() || isJoining}
+                disabled={!inputName.trim() || !selectedTable || isJoining}
                 className="font-serif rounded-lg bg-gradient-to-r from-champagne to-champagne-muted px-4 py-3 font-semibold tracking-wide text-navy transition-all hover:shadow-[0_4px_20px_rgba(212,175,55,0.4)] disabled:cursor-not-allowed disabled:from-navy/20 disabled:to-navy/20 disabled:text-navy/40"
               >
                 {isJoining ? "登録中..." : "参加する"}
@@ -351,10 +421,11 @@ export default function ParticipantPage() {
           <p className="font-serif text-xs tracking-[0.25em] text-champagne-muted uppercase">
             Your Record
           </p>
-          <p className="font-serif mt-3 text-lg text-navy/60">{name}</p>
+          <p className="font-serif mt-3 text-lg text-navy/60">
+            {table}卓 {name}
+          </p>
           <p className="font-display mt-6 text-5xl font-bold text-navy">
-            {formatScore(score)}
-            <span className="ml-1 text-2xl text-navy/50">秒</span>
+            {formatJapaneseTime(score)}
           </p>
           <div className="mx-auto mt-6 h-px w-16 bg-gradient-to-r from-transparent via-champagne to-transparent" />
           <p className="font-serif mt-4 text-sm text-navy/40">
@@ -368,7 +439,9 @@ export default function ParticipantPage() {
   if (inStopwatch) {
     return (
       <div className="bg-luxury-beige flex min-h-screen flex-col items-center justify-center px-4">
-        <p className="font-serif mb-6 text-sm text-navy/50">{name}</p>
+        <p className="font-serif mb-6 text-sm text-navy/50">
+          {table}卓 {name}
+        </p>
 
         {effectivePhase === "armed" && (
           <p className="font-serif animate-shimmer text-lg text-champagne-muted">
@@ -417,6 +490,7 @@ export default function ParticipantPage() {
           参加中
         </p>
         <p className="font-serif mt-3 text-3xl font-semibold text-navy">{name}</p>
+        <p className="font-display mt-1 text-sm text-champagne-muted">{table}卓</p>
         <div className="mx-auto mt-6 h-px w-16 bg-gradient-to-r from-transparent via-champagne to-transparent" />
         <p className="font-display mt-4 text-sm text-navy/50">
           8.<span className="text-champagne font-bold">22</span> 秒チャレンジ
